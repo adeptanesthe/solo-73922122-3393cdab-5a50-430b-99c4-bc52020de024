@@ -4,7 +4,7 @@ import random
 import pytest
 
 from app.stats import (InvalidStats, Stats, apply_correction, cov_numerator,
-                       mean_and_cov, merge)
+                       mean_and_cov, merge, remove)
 
 
 def raw_stats(rows):
@@ -83,3 +83,35 @@ def test_validate_rejects_asymmetric_outer():
 def test_validate_rejects_bad_n():
     with pytest.raises(InvalidStats):
         Stats.build(0, [0, 0, 0], [[0] * 3] * 3)
+
+
+def test_remove_is_exact_inverse_of_merge():
+    rng = random.Random(11)
+    stats = [raw_stats(sample_rows(60 + 10 * i, seed=11 + i))
+             for i in range(6)]
+    total = merge(stats)
+    for i, st in enumerate(stats):
+        rest = merge(s for j, s in enumerate(stats) if j != i)
+        assert remove(total, st) == rest
+    # removing everything one by one leaves the final single factory
+    pool = total
+    for st in stats[:-1]:
+        pool = remove(pool, st)
+    assert pool == stats[-1]
+
+
+def test_remove_rejects_empty_pool():
+    only = raw_stats(sample_rows(10, seed=3))
+    with pytest.raises(InvalidStats):
+        remove(only, only)
+
+
+def test_remove_keeps_huge_base_variance_exact():
+    big = 10**12
+    rows_a = [(big + i, 7, i) for i in range(20)]
+    rows_b = [(big + 100 + i, 9, 2 * i) for i in range(15)]
+    a, b = raw_stats(rows_a), raw_stats(rows_b)
+    fold = remove(merge([a, b]), b)
+    assert fold == a
+    _, cov = mean_and_cov(fold)
+    assert cov[0][0] > 0  # variance of the biggest-base factory survives

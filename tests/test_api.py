@@ -160,10 +160,10 @@ def test_predict_during_recompute_uses_current_version(client, monkeypatch):
     started = threading.Event()
     release = threading.Event()
 
-    def slow_train(stats):
+    def slow_train(stats, *args, **kwargs):
         started.set()
         assert release.wait(10)
-        return orig_train(stats)
+        return orig_train(stats, *args, **kwargs)
 
     monkeypatch.setattr(main_mod, "train", slow_train)
     outcome = {}
@@ -193,7 +193,7 @@ def test_predict_during_recompute_uses_current_version(client, monkeypatch):
 def test_factory_count_bounds(client):
     fs = demo_factories()
     assert client.post("/versions", json={"factories": fs[:2]}).status_code == 422
-    too_many = [dict(f, factory_id=f"X{i}") for i, f in enumerate(fs * 3)]
+    too_many = [dict(fs[0], factory_id=f"X{i}") for i in range(257)]
     assert client.post("/versions",
                        json={"factories": too_many}).status_code == 422
 
@@ -242,3 +242,94 @@ def test_beyond_int64_values_keep_variance(client):
     # edge factories extrapolate in LOFO, but if variance had collapsed to
     # zero the speed feature would be dropped and errors would be ~1e6+
     assert max(errs.values()) < 1e5
+
+
+# ------------------------------------------------------------- 256 factories
+def big_payload(k=256):
+    rng = random.Random(2024)
+    factories = []
+    for i in range(k):
+        rows = []
+        for _ in range(120 + (i % 5) * 24):
+            s = 1_000_000 + 40 * (i % 64) + rng.randint(-20, 20)
+            p = 500_000 + 10 * (i % 32) + rng.randint(-10, 10)
+            y = round(0.02 * s + 0.011 * p + 1500 + rng.gauss(0, 2))
+            rows.append((s, p, y))
+        factories.append(payload(f"F{i+1:03d}", rows))
+    return factories
+
+
+def test_create_version_with_256_factories(client):
+    r = client.post("/versions", json={"factories": big_payload(256)})
+    assert r.status_code == 201, r.text
+    body = r.json()
+    t = body["training"]
+    assert t["summary_ops"] == 511
+    assert t["legacy_summary_ops"] == 256 * 255
+    assert t["matrix_factorizations"] == 256
+    assert len(t["folds"]) == 256
+    assert len(body["factory_errors"]) == 256
+    # historical fetch returns the same persisted diagnostics
+    assert client.get(f"/versions/{body['version']}").json()["training"] == t
+    # predictions keep working against the committed current version
+    pr = client.post("/predict", json={"factory_id": "F001",
+                                       "speed": 1_000_000,
+                                       "pressure": 500_000})
+    assert pr.status_code == 200 and pr.json()["version"] == body["version"]
+
+
+def test_257_factories_rejected(client):
+    r = client.post("/versions", json={"factories": big_payload(257)})
+    assert r.status_code == 422
+
+
+def test_correction_chain_makes_one_fold_drop_pressure(client):
+    # three factories share a constant raw pressure 500000 but report
+    # different corrections; F4 has varying pressure.
+    const_rows = [(1000 + j % 11, 500000, 3000 + j % 7) for j in range(80)]
+    varying = make_rows(80, 1000, 500000, (1.8, 0.6), 40, 4, seed=9001)
+    factories = [
+        payload("F1", const_rows, correction=0),
+        payload("F2", const_rows, correction=-40),
+        payload("F3", const_rows, correction=10),
+        payload("F4", varying, correction=0),
+    ]
+    body = create(client, factories)
+    assert all(f["dropped_features"] == []
+               for f in body["training"]["folds"])
+    vid = body["version"]
+    for fid, corr in (("F2", 0), ("F3", 0)):
+        r = client.post(f"/versions/{vid}/correction",
+                        json={"factory_id": fid, "correction": corr})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        vid = body["version"]
+    fold_f4 = next(f for f in body["training"]["folds"]
+                   if f["factory_id"] == "F4")
+    assert fold_f4["dropped_features"] == ["pressure"]
+    assert all(f["dropped_features"] == []
+               for f in body["training"]["folds"] if f["factory_id"] != "F4")
+    # current version remains fully usable for prediction
+    assert client.post("/predict", json={"factory_id": "F4", "speed": 1000,
+                                         "pressure": 500000}).status_code == 200
+
+
+def test_failed_recompute_publishes_nothing(client, monkeypatch):
+    import app.main as main_mod
+    create(client)
+    before = client.get("/versions/current").json()["version"]
+    calls = {"n": 0}
+    orig = main_mod.train
+
+    def flaky(stats, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise main_mod.InvalidStats if hasattr(main_mod, "InvalidStats") \
+                else RuntimeError("boom")
+        return orig(stats, *args, **kwargs)
+
+    monkeypatch.setattr(main_mod, "train", flaky)
+    r = client.post("/versions/1/correction",
+                    json={"factory_id": "F3", "correction": 25})
+    assert r.status_code == 422
+    assert client.get("/versions/current").json()["version"] == before

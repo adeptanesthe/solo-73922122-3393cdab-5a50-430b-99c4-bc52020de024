@@ -15,11 +15,12 @@ from datetime import datetime, timezone
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS versions (
-    id          INTEGER PRIMARY KEY,
-    lambda      REAL NOT NULL,
-    scores_json TEXT NOT NULL,
-    model_json  TEXT NOT NULL,
-    created_at  TEXT NOT NULL
+    id            INTEGER PRIMARY KEY,
+    lambda        REAL NOT NULL,
+    scores_json   TEXT NOT NULL,
+    model_json    TEXT NOT NULL,
+    training_json TEXT NOT NULL DEFAULT '{}',
+    created_at    TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS factory_stats (
     version_id  INTEGER NOT NULL REFERENCES versions(id),
@@ -72,6 +73,13 @@ class Store:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
+        # Migration for databases created before the training-diagnostics column.
+        cols = {r["name"] for r in self._conn.execute(
+            "PRAGMA table_info(versions)").fetchall()}
+        if "training_json" not in cols:
+            self._conn.execute(
+                "ALTER TABLE versions ADD COLUMN training_json TEXT NOT NULL "
+                "DEFAULT '{}'")
 
     def close(self):
         with self._lock:
@@ -114,6 +122,7 @@ class Store:
             "lambda_scores": {float(k): val for k, val in
                               json.loads(v["scores_json"]).items()},
             "model": json.loads(v["model_json"]),
+            "training": json.loads(v["training_json"]),
             "created_at": v["created_at"],
             "factories": [
                 {
@@ -174,17 +183,28 @@ class Store:
                 raise
 
     # ---------------------------------------------------------- helpers
+    @staticmethod
+    def _training_view(result) -> dict:
+        return {
+            "summary_ops": result.summary_ops,
+            "legacy_summary_ops": result.legacy_summary_ops,
+            "matrix_factorizations": result.factorizations,
+            "near_tie_recheck": result.tie_rechecks,
+            "folds": [f.to_dict() for f in result.folds],
+        }
+
     def _insert_version(self, cur, factories, result) -> int:
         row = cur.execute("SELECT COALESCE(MAX(id), 0) + 1 AS nid FROM versions").fetchone()
         new_id = int(row["nid"])
         cur.execute(
-            "INSERT INTO versions (id, lambda, scores_json, model_json, created_at)"
-            " VALUES (?,?,?,?,?)",
+            "INSERT INTO versions (id, lambda, scores_json, model_json, "
+            "training_json, created_at) VALUES (?,?,?,?,?,?)",
             (
                 new_id,
                 result.lam,
                 json.dumps({str(k): v for k, v in result.lambda_scores.items()}),
                 json.dumps(result.model.to_dict()),
+                json.dumps(self._training_view(result)),
                 datetime.now(timezone.utc).isoformat(),
             ),
         )

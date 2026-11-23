@@ -31,7 +31,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             )
             for f in factories
         ]
-        return train(stats)
+        return train(stats, labels=[f["factory_id"] for f in factories])
 
     def _public(view: dict) -> dict:
         return {
@@ -42,6 +42,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "corrections": {f["factory_id"]: f["correction"]
                             for f in view["factories"]},
             "model": view["model"],
+            "training": view["training"],
             "created_at": view["created_at"],
         }
 
@@ -52,7 +53,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.post("/versions", status_code=201)
     def create_version(req: CreateVersionRequest):
-        """Onboard 3-8 factories and train a fresh model version."""
+        """Onboard 3-256 factories and train a fresh model version."""
         try:
             result = _train_from_dicts([f.model_dump() for f in req.factories])
         except InvalidStats as exc:

@@ -119,6 +119,29 @@ def merge(many) -> Stats:
     return Stats(n=n, sums=sums, outer=outer)
 
 
+def remove(total: Stats, one: Stats) -> Stats:
+    """Exact inverse of merge(): pooled stats with `one` factory taken out.
+
+    Every term is a plain integer subtraction, so the result is bit-for-bit
+    identical to merge()ing the remaining factories one by one.  This turns
+    leave-one-factory-out pooling into one pass to the total plus one
+    subtraction per fold -- O(K) summary operations instead of O(K^2).
+    The returned stats are already known to describe the same real readings,
+    so the (quadratic-size) PSD validation is deliberately skipped.
+    """
+    if one.n > total.n:
+        raise InvalidStats("cannot remove more samples than the pool holds")
+    n = total.n - one.n
+    if n < 1:
+        raise InvalidStats("at least one factory must remain in the pool")
+    sums = tuple(total.sums[i] - one.sums[i] for i in range(DIM))
+    outer = tuple(
+        tuple(total.outer[i][j] - one.outer[i][j] for j in range(DIM))
+        for i in range(DIM)
+    )
+    return Stats(n=n, sums=sums, outer=outer)
+
+
 def cov_numerator(st: Stats):
     """Exact integer matrix  C = N*sum(x x^T) - sum(x) sum(x)^T."""
     n = st.n

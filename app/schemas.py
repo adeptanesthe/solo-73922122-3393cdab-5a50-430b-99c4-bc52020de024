@@ -29,7 +29,7 @@ class FactoryPayload(BaseModel):
 
 
 class CreateVersionRequest(BaseModel):
-    factories: list[FactoryPayload] = Field(min_length=3, max_length=8)
+    factories: list[FactoryPayload] = Field(min_length=3, max_length=256)
 
     @field_validator("factories")
     @classmethod
